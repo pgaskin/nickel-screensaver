@@ -13,6 +13,7 @@
 #include <QFile>
 #include <QSettings>
 #include <QFileInfo>
+#include <QBuffer>
 
 typedef void N3PowerWorkflowManager;
 typedef void PowerViewController;
@@ -22,6 +23,10 @@ constexpr const char* BOOK_COLOR_OVERLAY            = "Book/ColorOverlay";
 constexpr const char* BOOK_COLOR_OVERLAY_ALPHA      = "Book/ColorOverlayAlpha";
 constexpr const char* WALLPAPER_COLOR_OVERLAY       = "Wallpaper/ColorOverlay";
 constexpr const char* WALLPAPER_COLOR_OVERLAY_ALPHA = "Wallpaper/ColorOverlayAlpha";
+
+constexpr const char* GLITCH_ENABLED    = "Glitch/Enabled";
+constexpr const char* GLITCH_ITERATIONS = "Glitch/Iterations";
+constexpr const char* GLITCH_QUALITY    = "Glitch/Quality";
 
 enum DISPLAY_MODE {
     None      = 0b00000,
@@ -57,17 +62,29 @@ struct nh_info nickelscreensaver = {
 };
 
 void save_settings(QSettings &settings) {
+    // Book
     QString book_color_overlay = settings.value(BOOK_COLOR_OVERLAY, "ffffff").toString();
     settings.setValue(BOOK_COLOR_OVERLAY, book_color_overlay);
 
     int book_color_overlay_alpha = qBound(0, settings.value(BOOK_COLOR_OVERLAY_ALPHA, 0).toInt(), 100);
     settings.setValue(BOOK_COLOR_OVERLAY_ALPHA, book_color_overlay_alpha);
 
+    // Wallpaper
     QString wallpaper_color_overlay = settings.value(WALLPAPER_COLOR_OVERLAY, "ffffff").toString();
     settings.setValue(WALLPAPER_COLOR_OVERLAY, wallpaper_color_overlay);
 
     int wallpaper_color_overlay_alpha = qBound(0, settings.value(WALLPAPER_COLOR_OVERLAY_ALPHA, 0).toInt(), 100);
     settings.setValue(WALLPAPER_COLOR_OVERLAY_ALPHA, wallpaper_color_overlay_alpha);
+
+    // Glitch
+    bool glitch_enabled = settings.value(GLITCH_ENABLED, false).toBool();
+    settings.setValue(GLITCH_ENABLED, glitch_enabled);
+
+    int glitch_iterations = qBound(2, settings.value(GLITCH_ITERATIONS, 5).toInt(), 10);
+    settings.setValue(GLITCH_ITERATIONS, glitch_iterations);
+
+    int glitch_quality = qBound(10, settings.value(GLITCH_QUALITY, 80).toInt(), 100);
+    settings.setValue(GLITCH_QUALITY, glitch_quality);
 
     // Save to file
     settings.sync();
@@ -181,6 +198,59 @@ bool write_blank_screensaver(const QString &file_path) {
     file.close();
 
     return written == sizeof(blank_screensaver);
+}
+
+QImage glitch_image(const QImage& source, int iterations, int quality = 90) {
+    // 1. Convert QImage to JPEG byte array
+    QByteArray ba;
+    QBuffer buffer(&ba);
+    buffer.open(QIODevice::WriteOnly);
+    source.save(&buffer, "JPG", quality);
+
+    // 2. Find the Start of Scan (SOS) marker: 0xFF 0xDA
+    const uchar* data = (const uchar*)ba.constData();
+    int img_size = ba.size();
+    int scan_start = 0;
+    for (int i = 0; i < img_size - 4; ++i) {
+        if (data[i] == 0xFF && data[i + 1] == 0xDA) {
+            // Big-endian: high byte at i+2, low byte at i+3
+            int sos_header_length = (data[i + 2] << 8) | data[i + 3];
+            scan_start = i + 2 + sos_header_length;
+            break;
+        }
+    }
+
+    if (scan_start == 0 || scan_start >= img_size - 2) {
+        return source;
+    }
+
+    // 3. Apply the glitch logic
+    iterations = qMax(1, iterations);
+
+    static int noise_length = 97;  // prime number
+    static QByteArray noise(noise_length, (char)1);
+    int data_size = img_size - scan_start - 2;  // Ignore EOI (End of Image), which is 2 bytes: 0xFFD9
+    int safe_range = data_size - noise_length;
+    if (safe_range <= 0) {
+        return source;
+    }
+
+    for (int i = 0; i < iterations; ++i) {
+        int glitch_index = scan_start + (qrand() % safe_range);
+        ba.replace(glitch_index, noise_length, noise);
+    }
+
+    QImage glitched;
+    if (!glitched.loadFromData(ba, "JPG")) {
+        return source;
+    }
+
+    return glitched;
+}
+
+QImage glitch_pixmap(const QPixmap& source, int iterations, int quality = 90) {
+    QImage img = source.toImage();
+    return glitch_image(img, iterations, quality);
 }
 
 extern "C" __attribute__((visibility("default")))
@@ -317,24 +387,36 @@ void ns_handle_sleep(N3PowerWorkflowManager* self) {
     }
 
     // 5. Handle transparent mode
-    QPixmap wallpaper;
+    QPixmap wallpaper_pixmap;
+    QImage wallpaper_image;
 
     QDesktopWidget* desktop_widget = QApplication::desktop();
     QScreen* screen = QGuiApplication::primaryScreen();
     QSize screen_size = screen->size();
 
+    bool glitch_enabled = settings.value(GLITCH_ENABLED, false).toBool();
+    int glitch_iterations = qBound(2, settings.value(GLITCH_ITERATIONS, 5).toInt(), 10);
+    int glitch_quality = qBound(10, settings.value(GLITCH_QUALITY, 80).toInt(), 100);
+
     if (display_mode & DISPLAY_MODE::Book) {
         // Take screenshot of the current screen if reading
         QRect geometry = current_view->geometry();
-        wallpaper = screen->grabWindow(
+        wallpaper_pixmap = screen->grabWindow(
             desktop_widget->winId(),
             geometry.left(),
             geometry.top(),
             geometry.width(),
             geometry.height()
         );
+
+        if (glitch_enabled) {
+            wallpaper_image = glitch_pixmap(wallpaper_pixmap, glitch_iterations, glitch_quality);
+        }
     } else if (display_mode & DISPLAY_MODE::Wallpaper and !wallpaper_file.isEmpty()) {
-        wallpaper.load(wallpaper_file);
+        wallpaper_image.load(wallpaper_file);
+        if (glitch_enabled && !wallpaper_image.isNull()) {
+            wallpaper_image = glitch_image(wallpaper_image, glitch_iterations, glitch_quality);
+        }
     }
 
     // 6. Combine overlay & wallpaper into target image
@@ -355,12 +437,19 @@ void ns_handle_sleep(N3PowerWorkflowManager* self) {
     QPainter painter(backing); // this will copy the image data if it's referenced somewhere else
 
     // Draw wallpaper
-    if (!wallpaper.isNull()) {
-        if (wallpaper.size() != screen_size) {
+    if (!wallpaper_image.isNull()) {
+        if (wallpaper_image.size() != screen_size) {
             // Only scales if different sizes
-            painter.drawPixmap(0, 0, wallpaper.scaled(screen_size, Qt::KeepAspectRatioByExpanding, Qt::FastTransformation));
+            painter.drawImage(0, 0, wallpaper_image.scaled(screen_size, Qt::KeepAspectRatioByExpanding, Qt::FastTransformation));
         } else {
-            painter.drawPixmap(0, 0, wallpaper);
+            painter.drawImage(0, 0, wallpaper_image);
+        }
+    } else if (!wallpaper_pixmap.isNull()) {
+        if (wallpaper_pixmap.size() != screen_size) {
+            // Only scales if different sizes
+            painter.drawPixmap(0, 0, wallpaper_pixmap.scaled(screen_size, Qt::KeepAspectRatioByExpanding, Qt::FastTransformation));
+        } else {
+            painter.drawPixmap(0, 0, wallpaper_pixmap);
         }
     }
 
